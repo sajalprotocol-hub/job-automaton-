@@ -9,6 +9,7 @@ import os
 from datetime import datetime
 import subprocess
 import sys
+import threading
 
 
 def load_jobs():
@@ -33,31 +34,77 @@ def load_jobs():
         return pd.DataFrame()
 
 
-def run_scraper():
+def run_scraper_background():
     """
-    Run the scraper script in the background
-    
-    Returns:
-        Success status
+    Run the scraper script in the background (non-blocking)
+    Updates session state with progress
     """
     try:
         # Get the directory where the script is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
         scraper_path = os.path.join(script_dir, 'scraper.py')
         
-        # Run scraper.py from the correct directory
-        result = subprocess.run(
+        # Update status
+        st.session_state['scraper_status'] = 'running'
+        st.session_state['scraper_start_time'] = datetime.now()
+        
+        # Run scraper.py in background using Popen (non-blocking)
+        process = subprocess.Popen(
             [sys.executable, scraper_path],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=300,  # 5 minute timeout
-            cwd=script_dir  # Set working directory
+            cwd=script_dir
         )
-        return result.returncode == 0, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "", "Scraper timed out after 5 minutes"
+        
+        # Store process in session state
+        st.session_state['scraper_process'] = process
+        
+        # Start monitoring thread (non-blocking)
+        def monitor_process():
+            try:
+                stdout, stderr = process.communicate()
+                return_code = process.returncode
+                
+                # Update session state when done
+                st.session_state['scraper_status'] = 'completed' if return_code == 0 else 'failed'
+                st.session_state['scraper_stdout'] = stdout if stdout else ""
+                st.session_state['scraper_stderr'] = stderr if stderr else ""
+                st.session_state['scraper_end_time'] = datetime.now()
+                st.session_state['scraper_process'] = None
+            except Exception as e:
+                st.session_state['scraper_status'] = 'failed'
+                st.session_state['scraper_stderr'] = str(e)
+                st.session_state['scraper_process'] = None
+        
+        # Start monitoring thread
+        thread = threading.Thread(target=monitor_process, daemon=True)
+        thread.start()
+        
     except Exception as e:
-        return False, "", str(e)
+        st.session_state['scraper_status'] = 'failed'
+        st.session_state['scraper_stderr'] = str(e)
+        st.session_state['scraper_process'] = None
+
+
+def check_scraper_status():
+    """
+    Check if scraper process is still running and update status
+    Called on each rerun to update status
+    """
+    if st.session_state.get('scraper_process') is not None:
+        process = st.session_state['scraper_process']
+        # Check if process is still running
+        if process.poll() is not None:
+            # Process finished
+            stdout, stderr = process.communicate()
+            return_code = process.returncode
+            
+            st.session_state['scraper_status'] = 'completed' if return_code == 0 else 'failed'
+            st.session_state['scraper_stdout'] = stdout if stdout else ""
+            st.session_state['scraper_stderr'] = stderr if stderr else ""
+            st.session_state['scraper_end_time'] = datetime.now()
+            st.session_state['scraper_process'] = None
 
 
 def main():
@@ -71,6 +118,18 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
+    
+    # Initialize session state for scraper
+    if 'scraper_status' not in st.session_state:
+        st.session_state['scraper_status'] = 'idle'  # idle, running, completed, failed
+        st.session_state['scraper_process'] = None
+        st.session_state['scraper_start_time'] = None
+        st.session_state['scraper_end_time'] = None
+        st.session_state['scraper_stdout'] = ""
+        st.session_state['scraper_stderr'] = ""
+    
+    # Check scraper status on each rerun
+    check_scraper_status()
     
     # Custom CSS for better styling
     st.markdown("""
@@ -95,7 +154,14 @@ def main():
     
     # Header
     st.markdown('<p class="main-header">📊 Job Automation Dashboard</p>', unsafe_allow_html=True)
-    st.markdown("**Data Analyst Roles Tracker - India Job Market**")
+    
+    # Show scraper status in header if running
+    if st.session_state['scraper_status'] == 'running':
+        elapsed = datetime.now() - st.session_state['scraper_start_time'] if st.session_state['scraper_start_time'] else None
+        elapsed_str = f" ({int(elapsed.total_seconds())}s)" if elapsed else ""
+        st.markdown(f"**🔄 Scraping jobs in background{elapsed_str} | Data Analyst Roles Tracker - India Job Market**")
+    else:
+        st.markdown("**Data Analyst Roles Tracker - India Job Market**")
     
     # Sidebar for controls
     with st.sidebar:
@@ -109,19 +175,42 @@ def main():
         
         # Scraper section
         st.subheader("🔍 Scraper")
-        if st.button("🚀 Run Scraper", use_container_width=True, type="primary"):
-            with st.spinner("Scraping jobs from Indeed India... This may take a few minutes."):
-                success, stdout, stderr = run_scraper()
-                
-                if success:
-                    st.success("✓ Scraping completed!")
-                    if stdout:
-                        st.text_area("Scraper Output", stdout, height=100, disabled=True)
-                    st.rerun()
-                else:
-                    st.error("✗ Scraping failed!")
-                    if stderr:
-                        st.text_area("Error Details", stderr, height=100, disabled=True)
+        
+        # Show scraper status
+        if st.session_state['scraper_status'] == 'running':
+            elapsed = datetime.now() - st.session_state['scraper_start_time'] if st.session_state['scraper_start_time'] else None
+            elapsed_str = f" ({int(elapsed.total_seconds())}s)" if elapsed else ""
+            st.info(f"🔄 Scraper is running in background...{elapsed_str}")
+            st.caption("💡 You can continue using the dashboard while scraping! Click 'Refresh Data' to check status.")
+        elif st.session_state['scraper_status'] == 'completed':
+            elapsed = st.session_state['scraper_end_time'] - st.session_state['scraper_start_time'] if st.session_state['scraper_start_time'] and st.session_state['scraper_end_time'] else None
+            elapsed_str = f" in {int(elapsed.total_seconds())}s" if elapsed else ""
+            st.success(f"✓ Scraping completed{elapsed_str}!")
+            if st.session_state.get('scraper_stdout'):
+                with st.expander("View Scraper Output"):
+                    st.text(st.session_state['scraper_stdout'])
+            # Reset status after showing
+            if st.button("🔄 Refresh Data", key="refresh_after_scrape"):
+                st.session_state['scraper_status'] = 'idle'
+                st.rerun()
+        elif st.session_state['scraper_status'] == 'failed':
+            st.error("✗ Scraping failed!")
+            if st.session_state.get('scraper_stderr'):
+                with st.expander("View Error Details"):
+                    st.text(st.session_state['scraper_stderr'])
+            if st.button("🔄 Clear Error", key="clear_error"):
+                st.session_state['scraper_status'] = 'idle'
+                st.rerun()
+        
+        # Run scraper button (disabled if already running)
+        if st.button(
+            "🚀 Run Scraper", 
+            use_container_width=True, 
+            type="primary",
+            disabled=(st.session_state['scraper_status'] == 'running')
+        ):
+            run_scraper_background()
+            st.rerun()
         
         st.divider()
         
@@ -292,4 +381,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
